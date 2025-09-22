@@ -5,70 +5,82 @@ import spacy
 import streamlit as st
 
 # --- CONFIGURATION & CONSTANTS ---
-st.set_page_config(layout="wide")
+st.set_page_config(layout="wide")  # Make the Streamlit layout full-width
 
-# Load spaCy model (optional but used to extract merchant names)
+# Try to load the SpaCy NLP model (used for merchant name extraction)
+# If it's not installed, fallback to basic string handling.
 try:
     nlp = spacy.load("en_core_web_sm")
 except (OSError, ImportError):
     st.warning(
-        "SpaCy model 'en_core_web_sm' not found. Merchant extraction will be basic. To install, run: python -m spacy download en_core_web_sm")
+        "SpaCy model 'en_core_web_sm' not found. Merchant extraction will be basic. "
+        "To install, run: python -m spacy download en_core_web_sm"
+    )
     nlp = None
 
-# Your budget qualifiers (categories)
+# Predefined budget categories
 BUDGET_CATEGORIES = [
     "Merchandise", "Gasoline", "Payments and Credits", "Restaurants", "Supermarkets",
     "Services", "Department Stores", "Education", "Travel/ Entertainment",
     "Awards and Rebate Credits", "Automotive", "Medical Services", "Government Services",
 ]
 
-# Create a budget dictionary (default 0) — you can fill real budget numbers here
+# Default budget targets for each category (all 0 for now, can be filled later)
 BUDGET_TARGETS = {cat: 0 for cat in BUDGET_CATEGORIES}
 
-# Categories to skip from expense calculations if negative (Payments & Awards)
+# Categories that shouldn’t be treated as negative expenses
 SKIP_FOR_NEGATIVE = ["Payments and Credits"]
 AWARDS_CATEGORY = "Awards and Rebate Credits"
 
+# Aliases for common column names across different banks
+# This helps auto-detect column names no matter how they appear in the CSV
 COLUMN_ALIASES = {
     'date': ['trans. date', 'transaction date', 'date', 'posting date'],
     'description': ['description', 'details', 'merchant', 'payee'],
     'category': ['category', 'type', 'classification'],
     'amount': ['amount', 'value', 'price', 'debit/credit', 'debit/credit (amount)'],
-    'deposit': ['deposit', 'credit', 'inflow'],
-    'withdrawal': ['withdrawal', 'debit', 'outflow']
+    'deposit': ['deposit', 'deposits', 'credit', 'inflow'],
+    'withdrawal': ['withdrawal', 'withdrawals', 'debit', 'outflow']
 }
 
-# ---------- HELPERS: column mapping ----------
-# --- CONSTANTS ---
-SAVINGS_NUMBER = "1234"  # Hardcode last 4 digits of savings account
+# Hardcoded last 4 digits of savings account (for transfer detection)
+SAVINGS_NUMBER = "1234"
 
 
-# ---------- HELPERS: column mapping ----------
+# ---------- HELPERS: COLUMN MAPPING ----------
 def find_and_map_columns(df):
-    """Tries to automatically find required columns, including deposits/withdrawals."""
-
+    """
+    Auto-detects which columns in the uploaded CSV map to our standard names
+    (date, description, category, amount, deposit, withdrawal).
+    Returns a dict mapping standard_name -> actual column in df.
+    """
     mapped_cols = {}
+    # Dictionary: lowercase column name -> original column name
     df_cols_lower = {col.lower(): col for col in df.columns}
+
     for standard_name, aliases in COLUMN_ALIASES.items():
-        mapped_cols[standard_name] = None
+        mapped_cols[standard_name] = None  # Default is None (missing)
         for alias in aliases:
             if alias in df_cols_lower:
-                mapped_cols[standard_name] = df_cols_lower[alias]
+                mapped_cols[standard_name] = df_cols_lower[alias]  # Map alias to real col
                 break
     return mapped_cols
 
 
 # ---------- CLASSIFICATION ----------
 def classify_transactions(df):
-    """Classifies transactions and normalizes amounts with custom rules."""
+    """
+    Classifies each transaction into Income, Expense, Transfer, etc.
+    Also normalizes some categories based on rules.
+    """
     df = df.copy()
 
-    # Ensure description and category are strings
+    # Make sure description and category are strings (avoid dtype errors)
     df['description'] = df.get('description', '').astype(str).fillna('')
     df['category'] = df.get('category', '').astype(str).fillna('')
 
-    df['transaction_type'] = 'Other'
-    df['category_str'] = df['category'].astype(str)
+    df['transaction_type'] = 'Other'  # Default type
+    df['category_str'] = df['category'].astype(str)  # Work copy
 
     # --- Rule 1: Savings transfers ---
     savings_mask = df['description'].str.contains(
@@ -93,62 +105,56 @@ def classify_transactions(df):
     zelle_expense_mask = transfer_mask & df['withdrawal'].notna()
     df.loc[zelle_expense_mask, ['transaction_type', 'category']] = ['Expense', 'Zelle Expense']
 
-    # --- Default Expense fallback ---
+    # --- Fallback: If category matches budget list, treat as Expense ---
     fallback_mask = (df['transaction_type'] == 'Other') & df['category_str'].isin(BUDGET_CATEGORIES)
     df.loc[fallback_mask, 'transaction_type'] = 'Expense'
 
+    # Drop helper col
     df.drop(columns=['category_str'], inplace=True, errors='ignore')
     return df
 
 
 # ---------- PROCESSING ----------
 def process_dataframe(df_raw, column_map):
-    """Standardize and process the dataframe with computed amounts if missing."""
-    # Always include description & category
-
+    """
+    Standardizes the raw DataFrame to use consistent column names.
+    Also ensures amount is calculated from deposits/withdrawals if missing.
+    """
+    # Always require description & category
     cols_to_keep = [column_map[k] for k in ['description', 'category'] if column_map.get(k)]
 
-    # Optional columns: date, amount, deposit, withdrawal
+    # Add optional columns if they exist
     for optional_col in ['date', 'amount', 'deposit', 'withdrawal']:
         if column_map.get(optional_col):
             cols_to_keep.append(column_map[optional_col])
 
+    # Subset dataframe to only keep needed columns
     standard_df = df_raw[cols_to_keep].copy()
 
-    # Ensure deposit and withdrawal columns exist
+    # Ensure deposit and withdrawal columns exist (add if missing)
     if 'deposit' not in standard_df.columns:
         standard_df['deposit'] = np.nan
     if 'withdrawal' not in standard_df.columns:
         standard_df['withdrawal'] = np.nan
 
-    # Rename to standard names
-    # Rename columns to standard names
+    # Rename uploaded columns to standard names
     rename_map = {v: k for k, v in column_map.items() if v}
     standard_df.rename(columns=rename_map, inplace=True)
 
-    # Ensure deposit and withdrawal exist
-    if 'deposit' not in standard_df.columns:
-        standard_df['deposit'] = np.nan
-    if 'withdrawal' not in standard_df.columns:
-        standard_df['withdrawal'] = np.nan
-
-    # Normalize numeric fields
+    # Clean numeric columns (amount, deposit, withdrawal)
     for col in ['amount', 'deposit', 'withdrawal']:
-        if col in standard_df:
-            standard_df[col] = pd.to_numeric(
-                standard_df[col].astype(str).str.replace(r'[$,]', '', regex=True),
-                errors='coerce'
-            )
+        if col in standard_df.columns:
+            if standard_df[col].dtype == object:  # If it's string-like
+                standard_df[col] = standard_df[col].astype(str).str.replace(r'[$,]', '', regex=True)
+            # Convert to numbers
+            standard_df[col] = pd.to_numeric(standard_df[col], errors='coerce')
 
-    # Compute amount if missing
+    # Compute "amount" if missing
     def compute_amount(row):
-        # If amount exists, use it
         if 'amount' in row and not pd.isna(row['amount']) and row['amount'] != 0:
             return row['amount']
-        # If withdrawal is empty, use negative deposit (income)
         if pd.isna(row.get('withdrawal')) or row.get('withdrawal') == 0:
             return -row.get('deposit', 0) if not pd.isna(row.get('deposit')) else 0
-        # If deposit is empty, use withdrawal (expense)
         if pd.isna(row.get('deposit')) or row.get('deposit') == 0:
             return row.get('withdrawal', 0) if not pd.isna(row.get('withdrawal')) else 0
         return 0
@@ -170,7 +176,7 @@ def process_dataframe(df_raw, column_map):
     # Classify transactions
     standard_df = classify_transactions(standard_df)
 
-    # Extract merchant
+    # Extract merchant name
     if nlp:
         docs = nlp.pipe(standard_df['description'].astype(str))
         merchants = [
@@ -183,11 +189,17 @@ def process_dataframe(df_raw, column_map):
 
     return standard_df
 
+
 # ---------- BUDGET ALIGN ----------
 def align_budgets_with_categories(df, budget_targets):
-    """Ensure all categories in the data have a budget entry."""
-    categories = df['category'].unique()
+    """
+    Make sure every category found in the data has a budget entry.
+    If a category is missing in the budget_targets, it gets a default of 0.
+    """
+    categories = df['category'].unique()  # Get all unique categories from the data
     aligned_budget = {cat: budget_targets.get(cat, 0) for cat in categories}
+
+    # Also ensure every "official" budget category exists in the dictionary
     for bc in BUDGET_CATEGORIES:
         if bc not in aligned_budget:
             aligned_budget[bc] = budget_targets.get(bc, 0)
@@ -196,42 +208,85 @@ def align_budgets_with_categories(df, budget_targets):
 
 # ---------- RECURRING CHARGES ----------
 def find_recurring_charges(df_year):
-    """Identifies recurring charges from Expenses in Services."""
-    expenses = df_year[(df_year['transaction_type'] == 'Expense') & (
-        df_year['category'].str.contains("Services", case=False, na=False))].copy()
+    """
+    Identifies recurring charges.
+    Logic:
+      - Look only at expenses in "Services" category.
+      - Group by merchant + absolute amount.
+      - If a transaction happens in at least 3 different months → treat as recurring.
+    """
+    # Filter to only "Expense" transactions in Services category
+    expenses = df_year[
+        (df_year['transaction_type'] == 'Expense') &
+        (df_year['category'].str.contains("Services", case=False, na=False))
+    ].copy()
+
     if expenses.empty:
         return pd.DataFrame()
 
+    # Normalize amounts (absolute value, rounded)
     expenses['amount_abs'] = expenses['amount'].abs().round(0)
+
+    # Group by merchant + amount, count number of unique months
     recurring_groups = expenses.groupby(['merchant', 'amount_abs'])['month'].nunique()
+
+    # Keep only those that appear in >= 3 months
     potential_recurring = recurring_groups[recurring_groups >= 3].reset_index()
+
     if not potential_recurring.empty:
+        # Also calculate average amount for those recurring transactions
         avg_amount = expenses.groupby(['merchant', 'amount_abs'])['amount'].mean().abs().reset_index(
-            name='Average Amount')
+            name='Average Amount'
+        )
+
+        # Merge count + average
         recurring_df = pd.merge(potential_recurring, avg_amount, on=['merchant', 'amount_abs'])
         recurring_df = recurring_df.rename(columns={'month': 'Frequency (Months)'})
+
+        # Return summary table
         return recurring_df[['merchant', 'Average Amount', 'Frequency (Months)']]
+
     return pd.DataFrame()
+
 
 
 # ---------- STYLING ----------
 def style_budget_difference(val):
-    """Applies color to budget difference."""
+    """
+    Style helper for budget DataFrame.
+    Colors numbers red if they are negative (overspent),
+    green if they are positive (under budget).
+    """
     return 'color: red' if val < 0 else 'color: green'
 
 
 # ---------- VISUALIZATIONS ----------
 def plot_pie_chart(category_totals):
+    """
+    Pie chart of category totals (only positive expenses).
+    """
     fig, ax = plt.subplots(figsize=(6, 6))
     category_totals = category_totals[category_totals > 0]
-    wedges, _, _ = ax.pie(category_totals, autopct='%1.1f%%', startangle=140, pctdistance=0.75)
-    ax.legend(wedges, category_totals.index, title="Categories", loc="center left", bbox_to_anchor=(1, 0, 0.5, 1))
-    ax.axis('equal')
+
+    wedges, _, _ = ax.pie(
+        category_totals,
+        autopct='%1.1f%%',
+        startangle=140,
+        pctdistance=0.75
+    )
+
+    # Add legend
+    ax.legend(wedges, category_totals.index, title="Categories",
+              loc="center left", bbox_to_anchor=(1, 0, 0.5, 1))
+    ax.axis('equal')  # Equal aspect ratio (circle)
     plt.tight_layout()
     return fig
 
 
 def plot_bar_chart(category_totals):
+    """
+    Bar chart of total expenses by category (absolute values).
+    """
     fig, ax = plt.subplots(figsize=(9, 5))
     category_totals.plot(kind='bar', ax=ax)
     ax.set_ylabel("Total ($)")
@@ -242,10 +297,15 @@ def plot_bar_chart(category_totals):
 
 
 def plot_normalized_bar(category_totals):
-    """Normalized to percent of total expenses."""
+    """
+    Bar chart of expenses normalized to % of total.
+    """
     fig, ax = plt.subplots(figsize=(9, 5))
+
+    # Normalize to percentages if total > 0
     normalized = category_totals / category_totals.sum() * 100 if category_totals.sum() > 0 else category_totals
     normalized.plot(kind='bar', ax=ax)
+
     ax.set_ylabel("Percent of Total Expenses (%)")
     ax.set_title("Expenses by Category (Normalized %)")
     plt.xticks(rotation=45, ha='right')
@@ -254,15 +314,24 @@ def plot_normalized_bar(category_totals):
 
 
 def plot_monthly_trends(df_year):
-    """Generates a stacked bar chart of monthly spending."""
-    monthly = df_year[df_year['transaction_type'] == 'Expense'].pivot_table(index='month', columns='category',
-                                                                            values='amount', aggfunc='sum',
-                                                                            fill_value=0)
+    """
+    Stacked bar chart of monthly spending broken down by category.
+    """
+    # Pivot: rows = month, columns = category, values = amount
+    monthly = df_year[df_year['transaction_type'] == 'Expense'].pivot_table(
+        index='month', columns='category',
+        values='amount', aggfunc='sum',
+        fill_value=0
+    )
+
+    # Order months correctly (Jan–Dec)
     try:
         month_order = pd.to_datetime(monthly.index, format='%B').month
         monthly = monthly.iloc[np.argsort(month_order)]
     except Exception:
         pass
+
+    # Plot stacked bars
     fig, ax = plt.subplots(figsize=(11, 6))
     monthly.plot(kind='bar', stacked=True, ax=ax)
     ax.set_ylabel("Amount ($)")
@@ -272,10 +341,12 @@ def plot_monthly_trends(df_year):
     return fig, monthly
 
 
+
 # ---------- STREAMLIT APP UI ----------
 st.title("📊 Financial Analyzer Pro")
-st.markdown("Upload your transaction CSV(s). Map columns, then press **Confirm and Process Data**.")
+st.markdown("Upload your transaction CSV(s). Auto-detect columns, then process data.")
 
+# Session state to persist across reruns
 if 'processed_data' not in st.session_state:
     st.session_state.processed_data = None
 if 'file_names' not in st.session_state:
@@ -283,51 +354,57 @@ if 'file_names' not in st.session_state:
 if 'column_map' not in st.session_state:
     st.session_state.column_map = None
 
+# Upload multiple CSVs
 uploaded_files = st.file_uploader("Upload CSV files", type="csv", accept_multiple_files=True)
 
 if uploaded_files:
     current_file_names = [f.name for f in uploaded_files]
+
+    # If new files uploaded, reset state
     if current_file_names != st.session_state.file_names:
         st.session_state.processed_data = None
         st.session_state.file_names = current_file_names
         st.session_state.column_map = None
 
     try:
-        # Read and combine all CSVs
+        # Read and clean all CSVs, then combine
         all_dfs = []
         for f in uploaded_files:
             df_temp = pd.read_csv(f, keep_default_na=False)
-            # Strip spaces, lowercase, remove duplicate columns
+
+            # Normalize column names: strip spaces, lowercase
             df_temp.columns = df_temp.columns.str.strip().str.lower()
+
+            # Drop duplicate column names
             df_temp = df_temp.loc[:, ~df_temp.columns.duplicated()]
             all_dfs.append(df_temp)
+
         combined_df = pd.concat(all_dfs, ignore_index=True)
 
+        # Only process if not already cached
         if st.session_state.processed_data is None:
-            # --- COLUMN MAPPING WITH (blank) OPTION ---
-            st.subheader("Step 1: Map Your Columns")
-            st.info(
-                "Select the correct column from your CSV for each field. Use '(blank)' if the column does not exist.")
+            # Auto-map columns using aliases
+            auto_map = find_and_map_columns(combined_df)
+
+            # Allow user to review/adjust mappings
+            st.subheader("Step 1: Verify Column Mapping")
+            st.info("We auto-detected your columns. Please confirm or adjust if needed.")
 
             user_map = {}
             for key in COLUMN_ALIASES.keys():
-                # Previous default if available
-                default_col = st.session_state.column_map.get(key) if st.session_state.column_map else None
-
-                # Add "(blank)" at top of options
+                # Dropdown options = (blank) + all actual columns
                 options = ["(blank)"] + combined_df.columns.tolist()
 
-                # Dropdown selectbox
+                # Preselect the detected column (if found)
+                default = auto_map.get(key)
                 selected = st.selectbox(
                     f"{key.capitalize()} Column",
                     options=options,
-                    index=options.index(default_col) if default_col in options else 0
+                    index=options.index(default) if default in options else 0
                 )
-
-                # Convert "(blank)" to None
                 user_map[key] = None if selected == "(blank)" else selected
 
-            # Process button
+            # Process data when user confirms
             if st.button("Confirm and Process Data"):
                 try:
                     st.session_state.processed_data = process_dataframe(combined_df, user_map)
@@ -340,96 +417,67 @@ if uploaded_files:
     except Exception as e:
         st.error(f"An error occurred reading uploaded files: {e}")
 
+
 # --- ANALYSIS DISPLAY ---
-if st.session_state.processed_data is not None and not st.session_state.processed_data.empty:
-    df = st.session_state.processed_data.copy()
-    st.success("Data processed successfully! Here is your analysis.")
-    st.markdown("---")
+# ---------- FINAL ANALYSIS / DASHBOARD ----------
+if st.session_state.processed_data is not None:
+    df = st.session_state.processed_data
 
-    years = sorted(df['year'].dropna().unique().astype(int), reverse=True)
-    if not years:
-        st.warning("No valid dates detected after processing; ensure your CSV has a valid date column.")
-    else:
-        selected_year = st.selectbox('**Select a Year to Analyze**', options=years)
-        df_year = df[df['year'] == int(selected_year)]
+    # Let user select which year to analyze
+    years = df['year'].dropna().unique()
+    years = sorted([int(y) for y in years if not pd.isna(y)])
+    selected_year = st.selectbox("Select Year", years)
 
-        st.header(f"Financial Summary for {selected_year}")
+    if selected_year:
+        # Filter data for selected year
+        df_year = df[df['year'] == selected_year]
 
-        total_income = df_year.loc[df_year['transaction_type'] == 'Income', 'amount'].sum()
-        total_expenses = df_year.loc[df_year['transaction_type'] == 'Expense', 'amount'].sum()
-        net_savings = total_income - total_expenses
+        # ---- Income / Expense / Savings Summary ----
+        st.subheader(f"📅 {selected_year} Summary")
 
-        # --- MODIFIED: Changed to 3 columns ---
+        total_income = df_year[df_year['transaction_type'] == 'Income']['amount'].sum()
+        total_expense = df_year[df_year['transaction_type'] == 'Expense']['amount'].sum()
+        savings = total_income + total_expense  # expenses are negative, so sum = net balance
+
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total Income", f"${total_income:,.2f}", help="Sum of transactions classified as 'Income'.")
-        col2.metric("Total Expenses", f"${total_expenses:,.2f}", help="Sum of transactions classified as 'Expense'.")
-        col3.metric("Net Savings", f"${net_savings:,.2f}", delta=f"{net_savings:,.2f}")
+        col1.metric("Total Income", f"${total_income:,.2f}")
+        col2.metric("Total Expenses", f"${-total_expense:,.2f}")
+        col3.metric("Net Savings", f"${savings:,.2f}")
 
-        st.markdown("---")
-        st.subheader("Total Yearly Spending by Category (Normalized %)")
-        yearly_expenses_by_cat = df_year[df_year['transaction_type'] == 'Expense'].groupby('category')['amount'].sum()
-        if yearly_expenses_by_cat.sum() > 0:
-            st.bar_chart((yearly_expenses_by_cat / yearly_expenses_by_cat.sum() * 100).sort_values(ascending=False))
-        else:
-            st.info("No expense data for the selected year.")
+        # ---- Category Totals ----
+        st.subheader("📂 Category Breakdown")
 
-        st.markdown("---")
-        st.header(f"Monthly Breakdown for {selected_year}")
-        months_with_data = sorted(df_year['month'].unique(), key=lambda m: pd.to_datetime(m, format='%B').month)
-        if months_with_data:
-            selected_month = st.selectbox('**Select a Month for a Detailed Summary**', options=months_with_data)
-        else:
-            selected_month = None
-            st.info("No monthly data available.")
+        category_totals = df_year.groupby('category')['amount'].sum().abs().sort_values(ascending=False)
+        st.dataframe(category_totals.reset_index().rename(columns={'amount': 'Total ($)'}))
 
-        if selected_month:
-            df_month = df_year[df_year['month'] == selected_month]
-            col1_month, col2_month = st.columns(2)
-            with col1_month:
-                st.subheader(f"Spending in {selected_month}")
-                category_totals = df_month[df_month['transaction_type'] == 'Expense'].groupby('category')[
-                    'amount'].sum()
-                if not category_totals.empty and category_totals.sum() > 0:
-                    st.pyplot(plot_pie_chart(category_totals))
-                else:
-                    st.info(f"No spending data for {selected_month}.")
-            with col2_month:
-                st.subheader("Budget vs. Actual")
-                aligned_budgets = align_budgets_with_categories(df_year, BUDGET_TARGETS)
-                budget_data = []
-                for c, b in aligned_budgets.items():
-                    actual = float(category_totals.get(c,
-                                                       0)) if 'category_totals' in locals() and not category_totals.empty else 0.0
-                    budget_data.append({"Category": c, "Budget": b, "Actual": actual, "Difference": b - actual})
-                budget_df = pd.DataFrame(budget_data).set_index('Category')
-                st.dataframe(
-                    budget_df.style.apply(lambda x: x.map(style_budget_difference), subset=['Difference']).format(
-                        '${:,.2f}'))
-
-        st.markdown("---")
-        st.header("Recurring Charges Analysis (Services Only)")
+        # ---- Recurring Charges ----
+        st.subheader("🔁 Recurring Charges (Services)")
         recurring_df = find_recurring_charges(df_year)
         if not recurring_df.empty:
-            st.write(recurring_df.style.format({'Average Amount': '${:,.2f}'}))
+            st.dataframe(recurring_df)
         else:
-            st.info("No recurring charges detected in 'Services' for this year.")
+            st.write("No recurring charges detected.")
 
-        st.markdown("---")
-        # --- MODIFIED: Charts panel now behind a button ---
-        st.header("Spending Visualizations")
-        if st.button("Show Spending Charts"):
-            chart_category_totals = df_year[df_year['transaction_type'] == 'Expense'].groupby('category')[
-                'amount'].sum().reindex(BUDGET_CATEGORIES, fill_value=0)
-            if chart_category_totals.sum() > 0:
-                st.subheader("Absolute Expenses by Category")
-                st.pyplot(plot_bar_chart(chart_category_totals))
+        # ---- Monthly Trends ----
+        st.subheader("📆 Monthly Spending Trends")
+        fig, monthly = plot_monthly_trends(df_year)
+        st.pyplot(fig)
+        st.dataframe(monthly)
 
-                st.subheader("Normalized Expenses by Category (%)")
-                st.pyplot(plot_normalized_bar(chart_category_totals))
+        # ---- Charts ----
+        st.subheader("📊 Visualizations")
 
-                st.subheader("Monthly Stacked Trend (Expenses)")
-                fig_monthly, monthly_df = plot_monthly_trends(df_year)
-                st.pyplot(fig_monthly)
-                st.dataframe(monthly_df)
-            else:
-                st.info("No expense data to plot for the selected year.")
+        # Pie chart
+        st.markdown("**Expenses by Category (Pie Chart)**")
+        fig = plot_pie_chart(category_totals)
+        st.pyplot(fig)
+
+        # Absolute bar chart
+        st.markdown("**Expenses by Category (Absolute $)**")
+        fig = plot_bar_chart(category_totals)
+        st.pyplot(fig)
+
+        # Normalized bar chart
+        st.markdown("**Expenses by Category (Normalized %)**")
+        fig = plot_normalized_bar(category_totals)
+        st.pyplot(fig)
