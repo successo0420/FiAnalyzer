@@ -794,10 +794,11 @@ if 'account_mappings' not in st.session_state:
 
 # Upload multiple CSVs
 uploaded_files = st.file_uploader("Upload CSV files", type="csv", accept_multiple_files=True)
+if "comp" not in st.session_state:
+    st.session_state.comp = pd.DataFrame()
 
 if uploaded_files:
     current_file_names = [f.name for f in uploaded_files]
-
     # If new files uploaded, reset state
     if current_file_names != st.session_state.file_names:
         st.session_state.processed_data = None
@@ -890,39 +891,131 @@ if uploaded_files:
 
             # Show suggested mappings for user review
             final_mappings = auto_mappings.copy()
-            #
-            # if suggested_mappings:
-            #     st.info(f"🤔 Please review {len(suggested_mappings)} suggested mappings:")
-            #
-            #     for orig_category, suggested_target in suggested_mappings.items():
-            #         col1, col2 = st.columns([3, 2])
-            #         with col1:
-            #             st.write(f"**'{orig_category}'** → suggested: *{suggested_target}*")
-            #         with col2:
-            #             options = ["✅ Accept", "❌ Keep Original"] + [f"📝 Map to {cat}" for cat in BUDGET_CATEGORIES if
-            #                                                          cat != suggested_target]
-            #             choice = st.selectbox(
-            #                 f"Action for '{orig_category}'",
-            #                 options=options,
-            #                 key=f"review_{orig_category}",
-            #                 label_visibility="collapsed"
-            #             )
-            #
-            #             if choice == "✅ Accept":
-            #                 final_mappings[orig_category] = suggested_target
-            #             elif choice.startswith("📝 Map to"):
-            #                 target = choice.replace("📝 Map to ", "")
-            #                 final_mappings[orig_category] = target
-            #
-            # # Show unmapped categories
-            # unmapped = [cat for cat in unique_categories if cat not in final_mappings]
-            # if unmapped:
-            #     with st.expander(f"📋 {len(unmapped)} categories will remain unchanged", expanded=False):
-            #         for cat in unmapped:
-            #             st.write(f"• {cat}")
-
             # Update the global mappings
             CATEGORY_MAPPINGS.update(final_mappings)
+
+            # -------------------------
+            # 📑 Budget Planner (fixed)
+            # -------------------------
+            st.subheader("📑 Budget Planner")
+
+            # Build a preview dataframe to compute categories & actuals for the budget template.
+            # Use the same process_dataframe logic but apply the final_mappings so the template matches
+            # what the processed data will look like once the user hits "Confirm and Process Data".
+            try:
+                preview_df = process_dataframe(combined_df, user_map)
+                if final_mappings:
+                    preview_df = apply_category_mappings(preview_df, final_mappings)
+            except Exception as e:
+                st.error(f"Could not build preview for budget template: {e}")
+                preview_df = None
+
+            if preview_df is None or preview_df.empty:
+                st.info("No preview data available for budget template yet.")
+            else:
+                # Build list of categories to include in the template (sorted, non-empty)
+                # Filter preview_df to only expenses
+                expense_df = preview_df[preview_df['transaction_type'] == 'Expense']
+
+                budget_categories = sorted(
+                    [c for c in expense_df['category'].unique() if c and str(c).strip() != ""]
+                )
+
+                # Create template DataFrame
+                template_df = pd.DataFrame({
+                    "Category": budget_categories,
+                    "Budget": [""] * len(budget_categories)  # empty cells for user to fill
+                })
+
+                # Create an in-memory Excel file (BytesIO) and write template_df to it
+                from io import BytesIO
+
+                buf = BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                    template_df.to_excel(writer, index=False, sheet_name="Budgets")
+                buf.seek(0)
+
+                # Download button for the template
+                st.download_button(
+                    label="⬇️ Download Budget Template (Excel)",
+                    data=buf.getvalue(),
+                    file_name="budget_template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
+                st.caption("Download this template, fill the 'Budget' column, then re-upload below.")
+
+                # Upload completed budget file
+                uploaded_budget = st.file_uploader("Upload your completed budget file (Excel or CSV)",
+                                                   type=["xlsx", "csv"], key="uploaded_budget")
+                if uploaded_budget is not None:
+                    try:
+                        # Read uploaded budget file into DataFrame
+                        if uploaded_budget.name.lower().endswith(".xlsx"):
+                            budget_df = pd.read_excel(uploaded_budget)
+                        else:
+                            budget_df = pd.read_csv(uploaded_budget)
+
+                        # normalize header names (strip + lowercase)
+                        budget_df.columns = [c.strip() for c in budget_df.columns.astype(str)]
+
+                        # Attempt to detect category & budget columns (case-insensitive)
+                        lower_cols = [c.lower() for c in budget_df.columns]
+                        # search for suitable category column
+                        cat_col = None
+                        for candidate in ["category", "cat", "categories", "category name"]:
+                            if candidate in lower_cols:
+                                cat_col = budget_df.columns[lower_cols.index(candidate)]
+                                break
+                        if cat_col is None:
+                            # fallback to first column if nothing obvious
+                            cat_col = budget_df.columns[0]
+
+                        # search for suitable budget column
+                        budget_col = None
+                        for candidate in ["budget", "amount", "budget ($)", "budget_amount", "value"]:
+                            if candidate in lower_cols:
+                                budget_col = budget_df.columns[lower_cols.index(candidate)]
+                                break
+                        if budget_col is None:
+                            # fallback to second column if it exists, else set 0 later
+                            budget_col = budget_df.columns[1] if len(budget_df.columns) > 1 else None
+
+                        # Prepare cleaned budget_df
+                        cleaned = pd.DataFrame()
+                        cleaned['Category'] = budget_df[cat_col].astype(str).str.strip()
+                        if budget_col is not None:
+                            cleaned['Budget'] = pd.to_numeric(budget_df[budget_col], errors='coerce').fillna(0)
+                        else:
+                            cleaned['Budget'] = 0.0
+
+                        # Build actuals from preview_df (abs amounts, grouped by category)
+                        actuals = preview_df.groupby('category')['amount'].sum().abs()
+                        actuals = actuals.reindex(budget_categories).fillna(0)  # keep ordering
+
+                        # Build comparison DataFrame (keep numeric columns for export)
+                        comp = pd.DataFrame({
+                            "Category": budget_categories,
+                            "Actual": actuals.values
+                        })
+
+                        # Map budgets to categories using case-insensitive match
+                        budget_map = dict(zip(cleaned['Category'].str.lower(), cleaned['Budget']))
+                        comp['Budget'] = comp['Category'].str.lower().map(budget_map).fillna(0).astype(float)
+
+                        # Calculate difference and status
+                        comp['Diff'] = comp['Budget'] - comp['Actual']
+
+
+                        def status_text(x):
+                            if abs(x) < 1e-9:
+                                return "✓"
+                            return "Under" if x > 0 else "Over"
+                        st.session_state.comp = comp
+
+
+                    except Exception as e:
+                        st.error(f"Error reading budget file or computing comparison: {e}")
 
             # Process data when user confirms
             if st.button("Confirm and Process Data"):
@@ -997,6 +1090,29 @@ if st.session_state.processed_data is not None:
             st.subheader("📂 Category Breakdown")
             if not category_totals.empty:
                 st.dataframe(category_totals.reset_index().rename(columns={'amount': 'Total ($)'}))
+                if not st.session_state.comp.empty:
+                    comp = st.session_state.comp
+                    comp['Status'] = comp['Diff'].apply(status_text)
+
+                    # Compact display formatting (no extra padding)
+                    # Create a display copy with nicely formatted currency strings for readability
+                    display = comp.copy()
+                    display['Budget'] = display['Budget'].map(lambda v: f"${v:,.2f}")
+                    display['Actual'] = display['Actual'].map(lambda v: f"${v:,.2f}")
+                    display['Diff'] = display['Diff'].map(lambda v: f"${v:,.2f}")
+
+                    st.write("### 📊 Budget vs Actual (compact)")
+                    st.table(display)  # compact presentation
+
+                    # Quick metrics
+                    total_budget = comp['Budget'].sum()
+                    total_actual = comp['Actual'].sum()
+                    leftover = total_budget - total_actual
+
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Total Budget", f"${total_budget:,.2f}")
+                    col2.metric("Total Actual", f"${total_actual:,.2f}")
+                    col3.metric("Remaining", f"${leftover:,.2f}")
             else:
                 st.write("No category data available.")
 
