@@ -1,32 +1,53 @@
-import pandas as pd
-import numpy as np
+import re
+from io import BytesIO
+
 import matplotlib.pyplot as plt
-import spacy
+import numpy as np
+import pandas as pd
 import streamlit as st
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import landscape, letter
+from reportlab.platypus import SimpleDocTemplate, TableStyle, Table
 
 # --- CONFIGURATION & CONSTANTS ---
-st.set_page_config(layout="wide")  # Make the Streamlit layout full-width
+st.set_page_config(layout="wide", page_title="Financial Analyzer Pro")
 
 # Try to load the SpaCy NLP model (used for merchant name extraction)
 # If it's not installed, fallback to basic string handling.
-try:
-    nlp = spacy.load("en_core_web_sm")
-except (OSError, ImportError):
-    st.warning(
-        "SpaCy model 'en_core_web_sm' not found. Merchant extraction will be basic. "
-        "To install, run: python -m spacy download en_core_web_sm"
-    )
-    nlp = None
 
 # Predefined budget categories
 BUDGET_CATEGORIES = [
     "Merchandise", "Gasoline", "Payments and Credits", "Restaurants", "Supermarkets",
     "Services", "Department Stores", "Education", "Travel/ Entertainment",
     "Awards and Rebate Credits", "Automotive", "Medical Services", "Government Services",
+    "Utilities", "Personal Expenses", "Credit Card Payment", "Transfers", "Groceries",
+    "Other Income", "Restaurants and Dining", "Deposits", "Office Supplies", "Paychecks",
+    "General Merchandise", "Services and Supplies", "Travel"
 ]
 
+# Category mapping to merge similar categories
+CATEGORY_MAPPINGS = {
+    # Merge similar restaurant categories
+    "Restaurants and Dining": "Restaurants",
+
+    # Merge similar grocery categories
+    "Groceries": "Supermarkets",
+
+    # Merge similar merchandise categories
+    "General Merchandise": "Merchandise",
+
+    # Merge similar services categories
+    "Services and Supplies": "Services",
+
+    # Merge similar travel categories
+    "Travel": "Travel/ Entertainment",
+
+    # You can add more mappings here as needed
+    # "Original Category": "Target Category"
+}
+
 # Default budget targets for each category (all 0 for now, can be filled later)
-BUDGET_TARGETS = {cat: 0 for cat in BUDGET_CATEGORIES}
+BUDGET_TARGETS = {cat: 100 for cat in BUDGET_CATEGORIES}
 
 # Categories that shouldn't be treated as negative expenses
 SKIP_FOR_NEGATIVE = ["Payments and Credits"]
@@ -42,9 +63,6 @@ COLUMN_ALIASES = {
     'deposit': ['deposit', 'deposits', 'credit', 'inflow'],
     'withdrawal': ['withdrawal', 'withdrawals', 'debit', 'outflow']
 }
-
-# Hardcoded last 4 digits of savings account (for transfer detection)
-SAVINGS_NUMBER = "1234"
 
 
 # ---------- HELPERS: COLUMN MAPPING ----------
@@ -70,7 +88,7 @@ def find_and_map_columns(df):
 # ---------- CLASSIFICATION ----------
 def classify_transactions(df):
     """
-    Classifies each transaction into Income, Expense, Transfer, etc.
+    Classifies each transaction into Income, Expense, Transfer, Credit Card Payment, etc.
     Also normalizes some categories based on rules.
     """
     df = df.copy()
@@ -89,38 +107,244 @@ def classify_transactions(df):
     df['transaction_type'] = 'Other'  # Default type
     df['category_str'] = df['category'].astype(str)  # Work copy
 
-    # --- Rule 1: Savings transfers ---
-    savings_mask = df['description'].str.contains(
-        fr'ONLINE TRANSFER TO.*{SAVINGS_NUMBER}$',
-        case=False, na=False
-    )
-    df.loc[savings_mask, 'category'] = 'Savings'
-    df.loc[savings_mask, 'transaction_type'] = 'Transfer'
+    # --- Rule 1: Credit Card Payments take priority ---
+    cc_keywords = ['credit card', 'cc payment', 'card payment', 'payment to', 'autopay']
+    cc_mask = df['category_str'].str.contains('|'.join(cc_keywords), case=False, na=False)
 
-    # --- Rule 2: Income from Paychecks/Other income ---
-    income_mask = df['category_str'].str.lower().isin(['paychecks', 'other income'])
+    df.loc[cc_mask, 'category'] = 'Credit Card Payment'
+    df.loc[cc_mask, 'transaction_type'] = 'Credit Card Payment'
+
+    # --- Rule 2: If not CC payment, handle Payments and Credits ---
+    payments_credits_mask = (df['category_str'] == 'Payments and Credits') & ~cc_mask
+    df.loc[payments_credits_mask, 'transaction_type'] = 'Duplicate CC Payment'
+    df.loc[payments_credits_mask, 'category'] = 'Payments and Credits'
+
+    # --- Rule 4: Income from Paychecks/Other income/Awards ---
+    income_categories = ['paychecks', 'other income', 'awards and rebate credits']
+    income_mask = df['category_str'].str.lower().isin(income_categories)
     df.loc[income_mask, 'transaction_type'] = 'Income'
 
-    # --- Rule 3: Zelle transfers ---
-    transfer_mask = df['category_str'].str.contains("transfer", case=False, na=False) & ~savings_mask
+    # Ensure Awards and Rebates are properly categorized as income
+    awards_mask = df['category_str'].str.contains('award|rebate', case=False, na=False)
+    df.loc[awards_mask, 'transaction_type'] = 'Income'
+    df.loc[awards_mask, 'category'] = AWARDS_CATEGORY
 
-    # Income if withdrawal is blank - check if withdrawal column exists
+    # --- Rule 5a: Account-to-account transfers (highest priority for transfers) ---
+    account_transfer_mask = df['description'].str.contains('ONLINE TRANSFER TO', case=False, na=False)
+    df.loc[account_transfer_mask, 'transaction_type'] = 'Transfer'
+    df.loc[account_transfer_mask, 'category'] = 'Account Transfer'
+
+    # --- Rule 5b: Zelle/external person-to-person transfers ---
+    external_transfer_keywords = ['zelle', 'zel', 'venmo', 'paypal', 'cashapp', 'apple pay']
+    zelle_mask = (df['category_str'].str.contains('|'.join(external_transfer_keywords), case=False, na=False) &
+                  ~account_transfer_mask)  # Exclude account transfers
+
+    # Use deposit/withdrawal columns to determine if Zelle is income or expense
+    if 'deposit' in df.columns and 'withdrawal' in df.columns:
+        # If deposit has value and withdrawal is NaN/blank, it's incoming Zelle (income)
+        incoming_zelle = zelle_mask & df['deposit'].notna() & df['withdrawal'].isna()
+        df.loc[incoming_zelle, 'transaction_type'] = 'Transfer'
+        df.loc[incoming_zelle, 'category'] = 'Zelle Income'
+
+        # If withdrawal has value and deposit is NaN/blank, it's outgoing Zelle (expense)
+        outgoing_zelle = zelle_mask & df['withdrawal'].notna() & df['deposit'].isna()
+        df.loc[outgoing_zelle, 'transaction_type'] = 'Transfer'
+        df.loc[outgoing_zelle, 'category'] = 'Zelle Expense'
+    else:
+        # Fallback if deposit/withdrawal columns don't exist
+        df.loc[zelle_mask, 'transaction_type'] = 'Transfer'
+        df.loc[zelle_mask, 'category'] = 'Zelle Transfer'
+
+    # --- Rule 5c: Other generic transfers ---
+    other_transfer_keywords = ['transfer', 'mobile deposit', 'wire transfer']
+    other_transfer_mask = (df['category_str'].str.contains('|'.join(other_transfer_keywords), case=False, na=False) &
+                           ~account_transfer_mask & ~zelle_mask)  # Exclude already classified transfers
+
+    df.loc[other_transfer_mask, 'transaction_type'] = 'Transfer'
+
+    # --- Rule 6: Income detection from deposits ---
+    income_keywords = ['deposit', 'payroll', 'salary', 'direct deposit', 'interest paid']
+    income_desc_mask = df['description'].str.contains('|'.join(income_keywords), case=False, na=False)
+
+    # Check for deposits or positive amounts
+    if 'deposit' in df.columns:
+        deposit_income_mask = income_desc_mask & df['deposit'].notna()
+    else:
+        deposit_income_mask = income_desc_mask & (df['amount'] > 0)
+
+    unclassified_mask = df['transaction_type'] == 'Other'
+    df.loc[deposit_income_mask & unclassified_mask, 'transaction_type'] = 'Income'
+
+    # --- Rule 7: Expense detection ---
+    # Expenses should be positive numbers - if we have negative amounts, they need to be handled
     if 'withdrawal' in df.columns:
-        zelle_income_mask = transfer_mask & df['withdrawal'].isna()
-        df.loc[zelle_income_mask, 'transaction_type'] = 'Income'
-        df.loc[zelle_income_mask, 'category'] = 'Zelle Income'
+        # Use withdrawal column for expense detection
+        withdrawal_expense_mask = df['withdrawal'].notna()
+        df.loc[withdrawal_expense_mask & unclassified_mask, 'transaction_type'] = 'Expense'
+    # else:
+    #     # Fallback: look for negative amounts (but remember expenses should be positive)
+    #     negative_amount_mask = df['amount'] < 0
+    #     df.loc[negative_amount_mask & unclassified_mask, 'transaction_type'] = 'Expense'
 
-        # Expense if withdrawal is present
-        zelle_expense_mask = transfer_mask & df['withdrawal'].notna()
-        df.loc[zelle_expense_mask, 'transaction_type'] = 'Expense'
-        df.loc[zelle_expense_mask, 'category'] = 'Zelle Expense'
+    # Also check for expense keywords
+    expense_keywords = ['purchase', 'payment', 'fee', 'charge', 'debit']
+    expense_desc_mask = df['description'].str.contains('|'.join(expense_keywords), case=False, na=False)
+    df.loc[expense_desc_mask & unclassified_mask, 'transaction_type'] = 'Expense'
 
     # --- Fallback: If category matches budget list, treat as Expense ---
     fallback_mask = (df['transaction_type'] == 'Other') & df['category_str'].isin(BUDGET_CATEGORIES)
     df.loc[fallback_mask, 'transaction_type'] = 'Expense'
 
+    # --- Final cleanup: Amount normalization ---
+    # Ensure expenses are positive numbers
+    expense_mask = df['transaction_type'] == 'Expense'
+    df.loc[expense_mask, 'amount'] = df.loc[expense_mask, 'amount'].abs()
+
+    # Ensure income are positive numbers
+    income_mask = df['transaction_type'] == 'Income'
+    df.loc[income_mask, 'amount'] = df.loc[income_mask, 'amount'].abs()
+
+    # For credit card payments and transfers, we typically want positive amounts for analysis
+    cc_payment_mask = df['transaction_type'] == 'Credit Card Payment'
+    df.loc[cc_payment_mask, 'amount'] = df.loc[cc_payment_mask, 'amount'].abs()
+
+    transfer_mask = df['transaction_type'] == 'Transfer'
+    df.loc[transfer_mask, 'amount'] = df.loc[transfer_mask, 'amount'].abs()
+
     # Drop helper col
     df.drop(columns=['category_str'], inplace=True, errors='ignore')
+
+    return df
+
+
+def smart_category_mapping(categories):
+    """
+    Use NLP similarity to automatically group similar categories.
+    Only returns mappings that need user review (high confidence matches).
+    """
+    from difflib import SequenceMatcher
+
+    # Predefined smart mappings based on common patterns
+    smart_mappings = {}
+    auto_mappings = {}
+
+    # Define keyword groups for automatic mapping
+    keyword_groups = {
+        "Restaurants": ["restaurant", "dining", "food", "eat", "cafe", "coffee", "pizza", "burger"],
+        "Supermarkets": ["grocery", "groceries", "supermarket", "market", "food store"],
+        "Gasoline": ["gas", "fuel", "gasoline", "petrol", "shell", "exxon", "bp"],
+        "Services": ["service", "services", "repair", "maintenance", "professional"],
+        "Merchandise": ["merchandise", "general merchandise", "retail", "shopping"],
+        "Travel/ Entertainment": ["travel", "entertainment", "hotel", "flight", "movie", "theater"],
+        "Automotive": ["auto", "automotive", "vehicle", "mechanic"],
+        "Medical Services": ["medical", "health", "doctor", "hospital", "pharmacy", "dental"],
+        "Utilities": ["utility", "utilities", "electric", "water", "gas", "internet", "phone"]
+    }
+
+    for category in categories:
+        if not category or category == '':
+            continue
+
+        category_lower = category.lower().strip()
+        best_match = None
+        best_score = 0
+
+        # Check keyword matching first
+        for target_category, keywords in keyword_groups.items():
+            for keyword in keywords:
+                if keyword in category_lower:
+                    if len(keyword) > best_score:  # Longer matches are better
+                        best_match = target_category
+                        best_score = len(keyword)
+
+        # If we found a good keyword match, auto-map it
+        if best_match and best_score >= 4:  # Minimum keyword length
+            auto_mappings[category] = best_match
+        else:
+            # Check for exact or near-exact matches with budget categories
+            for budget_cat in BUDGET_CATEGORIES:
+                similarity = SequenceMatcher(None, category_lower, budget_cat.lower()).ratio()
+                if similarity > 0.8:  # High similarity threshold
+                    if similarity > best_score:
+                        best_match = budget_cat
+                        best_score = similarity
+
+            # If similarity is very high, auto-map; otherwise, suggest for review
+            if best_score > 0.9:
+                auto_mappings[category] = best_match
+            elif best_score > 0.6:
+                smart_mappings[category] = best_match
+
+    return auto_mappings, smart_mappings
+
+
+def extract_account_numbers(df):
+    """
+    Extract account numbers from transfer descriptions.
+    Returns a set of unique account numbers found.
+    """
+    import re
+    account_numbers = set()
+
+    if 'description' not in df.columns:
+        return account_numbers
+
+    # Look for patterns like "XXXXX1234" or "TO XXXXX1234"
+    pattern = r'ONLINE TRANSFER TO\s+\w{5}(\d{4})'
+
+    for desc in df['description'].astype(str):
+        matches = re.findall(pattern, desc.upper())
+        account_numbers.update(matches)
+
+    return sorted(list(account_numbers))
+
+
+def calculate_account_balances(df, account_mappings):
+    """
+    Calculate the net amount for each account based on transfers.
+    """
+    if 'description' not in df.columns or not account_mappings:
+        return {}
+
+    # Initialize balances for all mapped accounts
+    account_balances = {
+        f"{account_type} (ending {account_num})": 0
+        for account_num, account_type in account_mappings.items()
+    }
+
+    # Pattern to find the last 4 digits of an account number
+    account_pattern = r'(\d{4})'
+
+    # Filter for relevant transaction types
+    transfer_df = df[df['transaction_type'].isin(['Transfer', 'Credit Card Payment'])].copy()
+
+    for _, row in transfer_df.iterrows():
+        desc = str(row['description']).upper()
+        amount = row.get('amount', 0)
+
+        matches = re.findall(account_pattern, desc)
+        for account_num in matches:
+            if account_num in account_mappings:
+                account_type = account_mappings[account_num]
+                account_key = f"{account_type} (ending {account_num})"
+
+                # If "TO" is in the description, it's an inflow for that account.
+                # Otherwise, assume it's an outflow.
+                if 'TO' in desc:
+                    account_balances[account_key] += abs(amount)
+                else:
+                    account_balances[account_key] -= abs(amount)
+                break  # Process only the first matched account number in a description
+
+    return account_balances
+
+
+def apply_category_mappings(df, mappings):
+    """
+    Apply category mappings to merge similar categories.
+    """
+    df = df.copy()
+    df['category'] = df['category'].replace(mappings)
     return df
 
 
@@ -197,9 +421,11 @@ def process_dataframe(df_raw, column_map):
         standard_df['date'] = pd.to_datetime(standard_df['date'], errors='coerce')
         standard_df['year'] = standard_df['date'].dt.year
         standard_df['month'] = standard_df['date'].dt.month_name()
+        standard_df['month_num'] = standard_df['date'].dt.month  # For sorting
     else:
         standard_df['year'] = np.nan
         standard_df['month'] = ''
+        standard_df['month_num'] = np.nan
 
     # Clean category
     standard_df['category'] = standard_df['category'].astype(str).str.strip()
@@ -207,21 +433,10 @@ def process_dataframe(df_raw, column_map):
     # Classify transactions
     standard_df = classify_transactions(standard_df)
 
-    # Extract merchant name
-    if nlp and 'description' in standard_df.columns:
-        try:
-            docs = nlp.pipe(standard_df['description'].astype(str))
-            merchants = [
-                next((ent.text for ent in doc.ents if ent.label_ in ["ORG", "PRODUCT"]), doc.text.split(' ')[0])
-                for doc in docs
-            ]
-            standard_df['merchant'] = merchants
-        except Exception:
-            # Fallback if NLP fails
-            standard_df['merchant'] = standard_df['description'].astype(str).str.split().str[0]
-    else:
-        # Basic merchant extraction
-        standard_df['merchant'] = standard_df['description'].astype(str).str.split().str[0]
+    # Apply category mappings to merge similar categories
+    standard_df = apply_category_mappings(standard_df, CATEGORY_MAPPINGS)
+
+    standard_df['merchant'] = standard_df['description'].astype(str).str.split().str[0]
 
     return standard_df
 
@@ -251,10 +466,11 @@ def find_recurring_charges(df_year):
       - Group by merchant + absolute amount.
       - If a transaction happens in at least 3 different months → treat as recurring.
     """
+    recurring_categories = {"Services", "Utilities", "Personal Expenses", "Office Supplies"}
     # Filter to only "Expense" transactions in Services category
     expenses = df_year[
         (df_year['transaction_type'] == 'Expense') &
-        (df_year['category'].str.contains("Services", case=False, na=False))
+        (df_year['category'].str.contains('|'.join(recurring_categories), case=False, na=False))
         ].copy()
 
     if expenses.empty:
@@ -300,38 +516,88 @@ def plot_pie_chart(category_totals):
     """
     Pie chart of category totals (only positive expenses).
     """
-    fig, ax = plt.subplots(figsize=(6, 6))
+    fig, ax = plt.subplots(figsize=(10, 8))
     category_totals = category_totals[category_totals > 0]
 
     if len(category_totals) == 0:
         ax.text(0.5, 0.5, 'No data to display', ha='center', va='center', transform=ax.transAxes)
         return fig
 
-    wedges, _, _ = ax.pie(
-        category_totals,
+    # Only show categories that are at least 2% of total to avoid clutter
+    total = category_totals.sum()
+    significant_categories = category_totals[category_totals / total >= 0.02]
+    other_amount = category_totals[category_totals / total < 0.02].sum()
+
+    if other_amount > 0:
+        significant_categories = pd.concat([significant_categories, pd.Series({'Other': other_amount})])
+
+    wedges, texts, autotexts = ax.pie(
+        significant_categories,
         autopct='%1.1f%%',
         startangle=140,
-        pctdistance=0.75
+        pctdistance=0.85
     )
 
     # Add legend
-    ax.legend(wedges, category_totals.index, title="Categories",
+    ax.legend(wedges, significant_categories.index, title="Categories",
               loc="center left", bbox_to_anchor=(1, 0, 0.5, 1))
+    ax.set_title("Expenses by Category Distribution")
     ax.axis('equal')  # Equal aspect ratio (circle)
     plt.tight_layout()
     return fig
+
+
+def categorize_transfers_by_account(df, account_mappings):
+    """
+    Categorize transfers based on account number mappings.
+    """
+    df = df.copy()
+    import re
+
+    if 'description' not in df.columns or not account_mappings:
+        return df
+
+    # Create pattern to match any account number
+    account_pattern = r'[A-Z\s]*(\d{4})(?:\s|$)'
+
+    for idx, row in df.iterrows():
+        if row.get('transaction_type') == 'Transfer' or 'transfer' in str(row.get('category', '')).lower():
+            desc = str(row['description']).upper()
+            matches = re.findall(account_pattern, desc)
+
+            for account_num in matches:
+                if account_num in account_mappings:
+                    account_type = account_mappings[account_num]
+                    # Determine if it's TO or FROM this account
+                    if 'to' in desc.lower() and account_num in desc:
+                        df.at[idx, 'category'] = f'Transfer to {account_type}'
+                    else:
+                        df.at[idx, 'category'] = f'Transfer from {account_type}'
+                    break
+
+    return df
 
 
 def plot_bar_chart(category_totals):
     """
     Bar chart of total expenses by category (absolute values).
     """
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(12, 8))
     if len(category_totals) > 0:
-        category_totals.plot(kind='bar', ax=ax)
-        ax.set_ylabel("Total ($)")
-        ax.set_title("Expenses by Category (Absolute $)")
-        plt.xticks(rotation=45, ha='right')
+        # Sort by value descending
+        category_totals_sorted = category_totals.sort_values(ascending=True)
+        bars = ax.barh(range(len(category_totals_sorted)), category_totals_sorted.values)
+        ax.set_yticks(range(len(category_totals_sorted)))
+        ax.set_yticklabels(category_totals_sorted.index)
+        ax.set_xlabel("Total Amount ($)")
+        ax.set_title("Expenses by Category")
+
+        # Add value labels on bars
+        for i, (idx, val) in enumerate(category_totals_sorted.items()):
+            ax.text(val + max(category_totals_sorted) * 0.01, i, f'${val:,.0f}',
+                    va='center', fontsize=9)
+
+        plt.subplots_adjust(left=0.2)
     else:
         ax.text(0.5, 0.5, 'No data to display', ha='center', va='center', transform=ax.transAxes)
     plt.tight_layout()
@@ -342,15 +608,23 @@ def plot_normalized_bar(category_totals):
     """
     Bar chart of expenses normalized to % of total.
     """
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(12, 8))
 
     if len(category_totals) > 0 and category_totals.sum() > 0:
         # Normalize to percentages if total > 0
-        normalized = category_totals / category_totals.sum() * 100
-        normalized.plot(kind='bar', ax=ax)
-        ax.set_ylabel("Percent of Total Expenses (%)")
-        ax.set_title("Expenses by Category (Normalized %)")
-        plt.xticks(rotation=45, ha='right')
+        normalized = (category_totals / category_totals.sum() * 100).sort_values(ascending=True)
+        bars = ax.barh(range(len(normalized)), normalized.values)
+        ax.set_yticks(range(len(normalized)))
+        ax.set_yticklabels(normalized.index)
+        ax.set_xlabel("Percent of Total Expenses (%)")
+        ax.set_title("Expenses by Category (Percentage Distribution)")
+
+        # Add percentage labels on bars
+        for i, (idx, val) in enumerate(normalized.items()):
+            ax.text(val + max(normalized) * 0.01, i, f'{val:.1f}%',
+                    va='center', fontsize=9)
+
+        plt.subplots_adjust(left=0.2)
     else:
         ax.text(0.5, 0.5, 'No data to display', ha='center', va='center', transform=ax.transAxes)
 
@@ -398,6 +672,112 @@ def plot_monthly_trends(df_year):
     return fig, monthly
 
 
+# ---------- EXPORT FUNCTIONS ----------
+def export_to_excel(df):
+    """
+    Export dataframe to Excel:
+      - First sheet = all transactions
+      - Separate sheet for each month (if data exists)
+    """
+    cols_to_drop = ["deposit", "withdrawal", "transaction_type", "month_num"]
+
+    # Convert df to list of lists for reportlab Table
+    df = df.drop(columns=cols_to_drop, errors="ignore")
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        # --- Full yearly data ---
+        df.to_excel(writer, sheet_name="All_Transactions", index=False)
+
+        # --- Monthly sheets ---
+        if "date" in df.columns:
+            # Make sure date is datetime
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+            # Drop rows without valid date
+            df_valid = df.dropna(subset=["date"]).copy()
+
+            # Group by month
+            df_valid["month"] = df_valid["date"].dt.month
+
+            # Write each month as separate sheet
+            month_map = {
+                1: "January", 2: "February", 3: "March", 4: "April",
+                5: "May", 6: "June", 7: "July", 8: "August",
+                9: "September", 10: "October", 11: "November", 12: "December"
+            }
+
+            for m, g in df_valid.groupby("month"):
+                sheet_name = month_map.get(m, f"Month{m}")
+                g.drop(columns=["month"], inplace=True)
+                g.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    output.seek(0)
+    return output
+
+
+def export_to_pdf(df):
+    """
+    Export processed dataframe to a PDF file (in-memory),
+    giving more space to Description and Merchant columns.
+    """
+    output = BytesIO()
+
+    # Create document with smaller margins
+    doc = SimpleDocTemplate(
+        output,
+        pagesize=landscape(letter),
+        leftMargin=20,
+        rightMargin=20,
+        topMargin=20,
+        bottomMargin=20
+    )
+
+    elements = []
+
+    # Drop columns you don't want in the report
+    cols_to_drop = ["deposit", "withdrawal", "transaction_type", "month_num"]
+    df = df.drop(columns=cols_to_drop, errors="ignore")
+
+    # Define column weights
+    # Description 3, Merchant 2, others 1 each
+    weights = []
+    for col in df.columns:
+        if col.lower() == "description":
+            weights.append(4)
+        else:
+            weights.append(1)
+
+    # Compute column widths proportional to page width
+    page_width, page_height = landscape(letter)
+    available_width = page_width - doc.leftMargin - doc.rightMargin
+    col_widths = [available_width * w / sum(weights) for w in weights]
+
+    # Convert dataframe to list of lists
+    data = [df.columns.tolist()] + df.astype(str).values.tolist()
+
+    # Create table
+    table = Table(data, colWidths=col_widths, repeatRows=1)
+
+    # Add styling
+    style = TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
+    ])
+
+    table.setStyle(style)
+
+    elements.append(table)
+    doc.build(elements)
+    output.seek(0)
+
+    return output
+
+
 # ---------- STREAMLIT APP UI ----------
 st.title("📊 Financial Analyzer Pro")
 st.markdown("Upload your transaction CSV(s). Auto-detect columns, then process data.")
@@ -409,6 +789,8 @@ if 'file_names' not in st.session_state:
     st.session_state.file_names = None
 if 'column_map' not in st.session_state:
     st.session_state.column_map = None
+if 'account_mappings' not in st.session_state:
+    st.session_state.account_mappings = {}
 
 # Upload multiple CSVs
 uploaded_files = st.file_uploader("Upload CSV files", type="csv", accept_multiple_files=True)
@@ -460,11 +842,101 @@ if uploaded_files:
                 )
                 user_map[key] = None if selected == "(blank)" else selected
 
+            # Get unique categories from the data for mapping
+            temp_df = process_dataframe(combined_df, user_map)
+            unique_categories = sorted([cat for cat in temp_df['category'].unique() if cat and cat != ''])
+
+            # Extract account numbers for transfer categorization
+            account_numbers = extract_account_numbers(temp_df)
+            account_mappings = {}
+
+            if account_numbers:
+                st.subheader("Step 2a: Map Account Numbers")
+                st.info(
+                    "We found account numbers in your transfer descriptions. Please specify what type of account each one is:")
+
+                account_types = ["Savings", "Growth", "Investment", "Credit Card", "Other"]
+
+                col1, col2 = st.columns(2)
+                for i, account_num in enumerate(account_numbers):
+                    with col1 if i % 2 == 0 else col2:
+                        selected_type = st.selectbox(
+                            f"Account ending in {account_num} is a:",
+                            options=account_types,
+                            key=f"account_{account_num}"
+                        )
+                        account_mappings[account_num] = selected_type
+
+            # Apply account-based transfer categorization
+            if account_mappings:
+                temp_df = categorize_transfers_by_account(temp_df, account_mappings)
+            unique_categories = sorted([cat for cat in temp_df['category'].unique() if cat and cat != ''])
+
+            # Category mapping with NLP assistance
+            st.subheader("Step 2b: Smart Category Mapping")
+            temp_df = process_dataframe(combined_df, user_map)
+
+            # Use NLP to automatically group categories
+            auto_mappings, suggested_mappings = smart_category_mapping(unique_categories)
+
+            # Show automatic mappings
+            if auto_mappings:
+                st.success(f"✅ Automatically mapped {len(auto_mappings)} categories:")
+                auto_df = pd.DataFrame([
+                    {"Original Category": orig, "Mapped To": target}
+                    for orig, target in auto_mappings.items()
+                ])
+                st.dataframe(auto_df, hide_index=True)
+
+            # Show suggested mappings for user review
+            final_mappings = auto_mappings.copy()
+            #
+            # if suggested_mappings:
+            #     st.info(f"🤔 Please review {len(suggested_mappings)} suggested mappings:")
+            #
+            #     for orig_category, suggested_target in suggested_mappings.items():
+            #         col1, col2 = st.columns([3, 2])
+            #         with col1:
+            #             st.write(f"**'{orig_category}'** → suggested: *{suggested_target}*")
+            #         with col2:
+            #             options = ["✅ Accept", "❌ Keep Original"] + [f"📝 Map to {cat}" for cat in BUDGET_CATEGORIES if
+            #                                                          cat != suggested_target]
+            #             choice = st.selectbox(
+            #                 f"Action for '{orig_category}'",
+            #                 options=options,
+            #                 key=f"review_{orig_category}",
+            #                 label_visibility="collapsed"
+            #             )
+            #
+            #             if choice == "✅ Accept":
+            #                 final_mappings[orig_category] = suggested_target
+            #             elif choice.startswith("📝 Map to"):
+            #                 target = choice.replace("📝 Map to ", "")
+            #                 final_mappings[orig_category] = target
+            #
+            # # Show unmapped categories
+            # unmapped = [cat for cat in unique_categories if cat not in final_mappings]
+            # if unmapped:
+            #     with st.expander(f"📋 {len(unmapped)} categories will remain unchanged", expanded=False):
+            #         for cat in unmapped:
+            #             st.write(f"• {cat}")
+
+            # Update the global mappings
+            CATEGORY_MAPPINGS.update(final_mappings)
+
             # Process data when user confirms
             if st.button("Confirm and Process Data"):
                 try:
-                    st.session_state.processed_data = process_dataframe(combined_df, user_map)
+                    processed_df = process_dataframe(combined_df, user_map)
+                    # Apply account-based transfer categorization
+                    if account_mappings:
+                        processed_df = categorize_transfers_by_account(processed_df, account_mappings)
+                    # Apply final category mappings
+                    processed_df = apply_category_mappings(processed_df, final_mappings)
+
+                    st.session_state.processed_data = processed_df
                     st.session_state.column_map = user_map
+                    st.session_state.account_mappings = account_mappings
                     st.success("Data processed successfully!")
                     st.rerun()
                 except Exception as e:
@@ -492,17 +964,34 @@ if st.session_state.processed_data is not None:
             # ---- TABLES SECTION ----
             st.header("📊 Data Tables")
 
-            # ---- Income / Expense / Savings Summary ----
-            st.subheader(f"📅 {selected_year} Summary")
+            # ---- MAIN SUMMARY WITH 5 CATEGORIES ----
+            st.subheader(f"📅 {selected_year} Financial Summary")
 
             total_income = df_year[df_year['transaction_type'] == 'Income']['amount'].sum()
             total_expense = df_year[df_year['transaction_type'] == 'Expense']['amount'].sum()
-            savings = total_income + total_expense  # expenses are negative, so sum = net balance
+            total_cc_payments = df_year[df_year['transaction_type'] == 'Credit Card Payment']['amount'].sum()
+            total_transfers = df_year[df_year['transaction_type'] == 'Transfer']['amount'].sum()
+            net_savings = total_income - total_expense  # All should sum to net savings
 
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Total Income", f"${total_income:,.2f}")
-            col2.metric("Total Expenses", f"${-total_expense:,.2f}")
-            col3.metric("Net Savings", f"${savings:,.2f}")
+            col2.metric("Total Expenses", f"${total_expense:,.2f}")
+            col3.metric("Credit Card Payments", f"${total_cc_payments:,.2f}")
+            col4.metric("Transfers", f"${total_transfers:,.2f}")
+            col5.metric("Net Savings", f"${net_savings:,.2f}")
+
+            # ---- ACCOUNT BALANCES ----
+            if hasattr(st.session_state, 'account_mappings') and st.session_state.account_mappings:
+                st.subheader("💰 Account Balance Changes")
+                account_balances = calculate_account_balances(df_year, st.session_state.account_mappings)
+
+                if account_balances:
+                    balance_df = pd.DataFrame([
+                        {"Account": account, "Net Change": f"${balance:,.2f}",
+                         "Direction": "↗️" if balance > 0 else "↘️"}
+                        for account, balance in account_balances.items()
+                    ])
+                    st.dataframe(balance_df, hide_index=True)
 
             # ---- Category Totals ----
             st.subheader("📂 Category Breakdown")
@@ -527,10 +1016,60 @@ if st.session_state.processed_data is not None:
             else:
                 st.write("No monthly data available.")
 
-            # ---- CHARTS SECTION ----
-            st.header("📈 Visualizations")
+            # ---- Monthly Transaction ----
+            st.subheader("Monthly Transactions")
+            # 1. Get a list of unique month names from your DataFrame
+            available_months = df_year['month'].unique()
 
-            if st.button("Show Charts", type="primary"):
+            # 2. Create a chronological month order to sort by
+            # This converts month names to datetime objects to determine their correct order
+            month_order = pd.to_datetime(available_months, format='%B').sort_values().month_name().unique()
+
+            # 3. Create the selectbox using the sorted list of months
+            selected_month = st.selectbox("Select a month", month_order)
+            if selected_month:
+                month_df = df_year[df_year['month'] == selected_month]
+                st.dataframe(month_df)
+                expenses_only = month_df[month_df['transaction_type'] == 'Expense']
+                category_totals = expenses_only.groupby('category')['amount'].sum()
+                st.header("📈 Monthly Visualizations")
+                if st.button("Show Monthly Charts", type="primary"):
+                    if not category_totals.empty:
+                        # Pie chart
+                        st.subheader("Expenses by Category (Pie Chart)")
+                        fig_pie = plot_pie_chart(category_totals)
+                        st.pyplot(fig_pie)
+
+                        # Absolute bar chart
+                        st.subheader("Expenses by Category (Absolute $)")
+                        fig_bar = plot_bar_chart(category_totals)
+                        st.pyplot(fig_bar)
+
+                        # Normalized bar chart
+                        st.subheader("Expenses by Category (Normalized %)")
+                        fig_norm = plot_normalized_bar(category_totals)
+                        st.pyplot(fig_norm)
+
+                        income_only = month_df[month_df['transaction_type'] == 'Income']
+                        income_totals = income_only.groupby('category')['amount'].sum()
+
+                        st.subheader("💰 Income by Category")
+                        if not income_totals.empty:
+                            fig = plot_pie_chart(income_totals)
+                            st.pyplot(fig)
+
+                            fig = plot_bar_chart(income_totals)
+                            st.pyplot(fig)
+                        else:
+                            st.info("No income found.")
+                    else:
+                        st.write("No expense data available for visualization.")
+
+                # ---- CHARTS SECTION ----
+            st.header("📈 Yearly Visualizations")
+            expenses_only = df[df['transaction_type'] == 'Expense']
+            category_totals = expenses_only.groupby('category')['amount'].sum()
+            if st.button("Show Yearly Charts", type="primary"):
                 if not category_totals.empty:
                     # Monthly trends chart
                     st.subheader("📆 Monthly Spending Trends (Chart)")
@@ -550,7 +1089,36 @@ if st.session_state.processed_data is not None:
                     st.subheader("Expenses by Category (Normalized %)")
                     fig_norm = plot_normalized_bar(category_totals)
                     st.pyplot(fig_norm)
+
+                    income_only = df[df['transaction_type'] == 'Income']
+                    income_totals = income_only.groupby('category')['amount'].sum()
+
+                    st.subheader("💰 Income by Category")
+                    if not income_totals.empty:
+                        fig = plot_pie_chart(income_totals)
+                        st.pyplot(fig)
+
+                        fig = plot_bar_chart(income_totals)
+                        st.pyplot(fig)
+                    else:
+                        st.info("No income found.")
                 else:
                     st.write("No expense data available for visualization.")
+
+            st.subheader("📥 Download Data")
+
+            excel_file = export_to_excel(st.session_state.processed_data)
+            st.download_button(
+                label="Download as Excel",
+                data=excel_file,
+                file_name="transactions.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+            pdf_file = export_to_pdf(
+                st.session_state.processed_data,
+            )
+            st.download_button("Download PDF", data=pdf_file, file_name="transactions.pdf", mime="application/pdf")
+
     else:
         st.warning("No valid year data found in the processed data.")
