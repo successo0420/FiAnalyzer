@@ -3,4 +3,8 @@ pandas
 numpy
 matplotlib
 reportlab
+<<<<<<< HEAD
 xlsxwriter
+=======
+xlsxwriter
+>>>>>>> origin/master
