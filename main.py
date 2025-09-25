@@ -897,7 +897,7 @@ if uploaded_files:
             # -------------------------
             # 📑 Budget Planner (fixed)
             # -------------------------
-            st.subheader("📑 Budget Planner")
+            st.subheader("Step 3. 📑 Budget Planner")
 
             # Build a preview dataframe to compute categories & actuals for the budget template.
             # Use the same process_dataframe logic but apply the final_mappings so the template matches
@@ -1092,8 +1092,6 @@ if st.session_state.processed_data is not None:
                 st.dataframe(category_totals.reset_index().rename(columns={'amount': 'Total ($)'}))
                 if not st.session_state.comp.empty:
                     comp = st.session_state.comp
-                    comp['Status'] = comp['Diff'].apply(status_text)
-
                     # Compact display formatting (no extra padding)
                     # Create a display copy with nicely formatted currency strings for readability
                     display = comp.copy()
